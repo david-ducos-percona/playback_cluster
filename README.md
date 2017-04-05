@@ -30,14 +30,14 @@ Application Options:
 
 ### Spliter 
 ```
-cat slow_query_log.log | ./playback_cluster -o SOCKET -h 127.0.0.1:5000,127.0.0.1:5001
+tail -f general_log.log | pt-query-digest  --output slowlog --type genlog --no-report  | playback_cluster -o SOCKET -h 127.0.0.1:5000,127.0.0.1:5001
 ```
 ### Clients
 ```
-nc -k -l 127.0.0.1 5000 | ./a.out -h 127.0.0.1:5000,127.0.0.1:5001 --output MYSQL -u root -p david -S /tmp/mysql.sock
+nc -k -l 127.0.0.1 5000 | playback_cluster -h 127.0.0.1:5000,127.0.0.1:5001 --output MYSQL -u root -p david -S /tmp/mysql.sock
 ```
 ```
-nc -k -l 127.0.0.1 5001 | ./a.out -h 127.0.0.1:5000,127.0.0.1:5001 --output MYSQL -u root -p david -S /tmp/mysql.sock
+nc -k -l 127.0.0.1 5001 | playback_cluster -h 127.0.0.1:5000,127.0.0.1:5001 --output MYSQL -u root -p david -S /tmp/mysql.sock
 ```
 
 ## TODO
