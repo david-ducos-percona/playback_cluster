@@ -184,7 +184,8 @@ void *read_process(GAsyncQueue**queue){
          read_line(infile,FALSE,data,&eof);
       }
    }
-   for (int i=0; i < host_length;i++){
+   int i=0;
+   for (; i < host_length;i++){
       g_async_queue_push(queue[i], "END THREAD");
    }
    return NULL;
@@ -213,8 +214,9 @@ int main (int argc, char *argv[]){
 
    if (g_strrstr(output,"SOCKET")){
       GAsyncQueue* queue[host_length];
+      int i=0;
       GThread **threads= g_new(GThread*, host_length+1);
-      for (int i=0; i < host_length;i++){
+      for (; i < host_length;i++){
          gchar **host_port=g_strsplit(host_list[i],":",1);
          struct thread_config *config=g_new(struct thread_config,1);
          config->host=host_port[0];
@@ -230,8 +232,8 @@ int main (int argc, char *argv[]){
          threads[i]= g_thread_new("lala",(GThreadFunc)process_queue, config);
       }
       threads[host_length]=g_thread_new("lala",(GThreadFunc)read_process,queue);
-
-      for (int i=0; i < host_length+1;i++){
+      i=0;
+      for (; i < host_length+1;i++){
          g_thread_join(threads[i]);
       }
    }else{
