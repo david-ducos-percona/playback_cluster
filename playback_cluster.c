@@ -64,6 +64,7 @@ MYSQL * new_mysql_connection(char *host, int port){
 int send_mysql_data(MYSQL * connection,char *data) {
   int error ;
 //  g_message("Sending data");
+  gint64 fromtime=g_get_real_time();
   error=mysql_real_query(connection, data, strlen(data));
   if (error) {
       g_critical("Error %s%s", mysql_error(connection),data); 
@@ -71,7 +72,7 @@ int send_mysql_data(MYSQL * connection,char *data) {
   }else{
 //      g_message("OKKKK %s",data);
   }
-  
+  gint64 totime=g_get_real_time();
   MYSQL_RES * result;
   int state=0;
   while (!state){
@@ -133,7 +134,8 @@ void *process_queue(struct thread_config *config) {
 void *process_mysql_queue(struct thread_config *config) {
    g_message("Adding new process");
    for(;;) {
-      char * line= (char*)g_async_queue_pop(config->queue);
+      struct query *q =(struct query *)g_async_queue_pop(config->queue);
+      char * line= q->statement;
       if (g_strrstr(line,"END THREAD"))
          break;
       send_mysql_data(config->mysql_connection,line);
@@ -157,7 +159,7 @@ void *read_process(GAsyncQueue**queue){
       if (g_strrstr(data->str,"# Thread_id: ")){
          gchar **elements = g_strsplit(data->str,":",2);
          thread_id = g_ascii_strtoll(elements[1],NULL,10);
-         g_message("Thread_id: %d \t Possition of the server: %d",thread_id,thread_id%host_length);
+//         g_message("Thread_id: %d \t Possition of the server: %d",thread_id,thread_id%host_length);
          g_async_queue_push(queue[thread_id%host_length], data->str);
          data=g_string_new("");
          read_line(infile,FALSE,data,&eof);
@@ -253,14 +255,13 @@ int main (int argc, char *argv[]){
             gchar **elements = g_strsplit(data->str,":",2);
             char * thread_id =elements[1];
 
-
             GThread * thread=g_datalist_get_data(&process_list,thread_id);
             
             if (thread==NULL){
                // Thread id not found in the list of processes assigned | We need to create a new process
                queue=g_async_queue_new();
                struct thread_config *config=g_new(struct thread_config,1);
-               config->host="127.0.0.1";
+               config->host=hostlist;
                config->queue=queue;
                config->port=mysql_port;
                config->mysql_connection = new_mysql_connection(config->host,config->port);
@@ -269,13 +270,17 @@ int main (int argc, char *argv[]){
                g_datalist_set_data(&queue_list,thread_id,queue);
             }else{
                // Thread id found in the list of processes assigned, so we need to send to the correct queue
-//               g_message("Esta!!! %s", thread_id);
                queue=g_datalist_get_data(&queue_list,thread_id);
             }
             data=g_string_new("");
             GString *statement=g_string_new("");
             read_line(infile,FALSE,data,&eof);
+            float query_time=0;
             while (!feof(infile)&& !eof && !g_strrstr(data->str,"# Thread_id: ")){
+              if (g_strrstr(data->str,"# Query_time: ")){
+                  gchar **elements = g_strsplit(data->str," ",5);
+                  query_time =atof(elements[3]);
+              }
 //            g_message("Sending line: %s",data->str);
 //               g_async_queue_push(queue, data->str);
                if (data != NULL && data->str != NULL && data->str[0]!='#')
@@ -284,8 +289,10 @@ int main (int argc, char *argv[]){
                read_line(infile,FALSE,data,&eof);
             } 
             if (statement != NULL && statement->str != NULL && statement->len>2 ){
-              
-               g_async_queue_push(queue, statement->str);
+               struct query *q=g_new0(struct query,1);
+               q->statement=statement->str;
+               q->time=query_time;
+               g_async_queue_push(queue, q);
             }
          }else{
 //         g_message("Discarding line: %s",data->str);

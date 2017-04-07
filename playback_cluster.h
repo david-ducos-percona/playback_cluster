@@ -15,3 +15,9 @@ struct thread_config {
    GSocketConnection *connection;
    MYSQL *mysql_connection;
 };
+
+struct query {
+   char *statement;
+   float time;
+};
+
