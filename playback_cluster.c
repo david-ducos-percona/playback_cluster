@@ -10,6 +10,7 @@
 
 gchar *hostlist;
 gchar *output;
+gchar *input_type=NULL;
 
 int host_length;
 static GOptionEntry entries[] =
@@ -18,26 +19,197 @@ static GOptionEntry entries[] =
         { "user", 'u', 0, G_OPTION_ARG_STRING, &username, "Username with the necessary privileges", NULL },
         { "password", 'p', 0, G_OPTION_ARG_STRING, &password, "User password", NULL },
         { "socket", 'S', 0, G_OPTION_ARG_STRING, &socket_path, "UNIX domain socket file to use for connection", NULL },
-        { "output", 'o', 0, G_OPTION_ARG_STRING, &output, "Where to send the input: MYSQL or SOCKET", NULL }
-
+        { "output", 'o', 0, G_OPTION_ARG_STRING, &output, "Where to send the input: MYSQL or SOCKET", NULL },
+        { "type", 't', 0, G_OPTION_ARG_STRING, &input_type, "The input kind which can be GENERAL or SLOWLOG", NULL }
 };
 
+MYSQL * new_mysql_connection(char *host, int port, char *db);
+void *process_mysql_queue(struct thread_config *config);
+gboolean read_line(FILE *file, gboolean is_compressed, GString *data, gboolean *eof);
+
+      // We considered that this regexp is enough to determine a new line
+char * regex = "^[0-9]{4}-[0-9]{2}-[0-9]{2}.*\t";
+
+void send_to_mysql_general(){
+      GArray * free_indexes=g_array_new(FALSE,FALSE,sizeof(int));
+
+      GData * queue_list;
+      g_datalist_init(&queue_list);
+
+      GData * process_list;
+      g_datalist_init(&process_list);
+
+
+      // We considered that this regexp is enough to determine a new line
+
+      FILE *infile=stdin;
+      gboolean eof=FALSE;
+      GString *data=g_string_new("");
+      read_line(infile,FALSE,data,&eof);
+
+      GAsyncQueue* queue;
+      GThread * thread;
+      gboolean found;
+      int i=0;
+      while (!feof(infile)&& !eof){
+         found=g_regex_match_simple(regex, data->str, 0, 0);
+         if (found){
+            gchar **elements = g_strsplit(data->str,"\t",4);
+            gchar **elements2 = g_strsplit(elements[1]," ",2);
+            char * thread_id =elements2[0];
+            char * command =elements2[1];
+            int thread_id_key = atoi(thread_id);
+//            g_message("Thead_id: %s - %d",thread_id,thread_id_key);
+            thread=NULL;
+            queue=NULL;
+            thread=g_datalist_id_get_data(&process_list,thread_id_key);
+
+            if (thread==NULL){ // NULL will means that the Thread id was not found, which means that we need to establish a new connection
+               if (g_strrstr(command,"Connect")) {
+                 gchar ** elements3 = g_strsplit(elements[2]," ",4);
+                 char *database=elements3[2];
+                 g_message("Connecting %s to database: %s",thread_id,database);
+                 // Thread id not found in the list of processes assigned | We need to create a new process
+                 queue=g_async_queue_new();
+
+                 // Initilizing Thread
+                 struct thread_config *config=g_new(struct thread_config,1);
+                 config->host=hostlist;
+                 config->queue=queue;
+                 config->port=mysql_port;
+                 config->thread_id=thread_id;
+                 config->mysql_connection = new_mysql_connection(config->host,config->port,database);
+                 thread= g_thread_new("MySQL_Thread",(GThreadFunc)process_mysql_queue, config);
+
+                 // Adding to the list of process
+                 g_datalist_id_set_data(&process_list,thread_id_key,thread);
+                 // Adding to the list of Threads id
+                 g_datalist_set_data(&queue_list,thread_id,queue);
+               }
+            }else{
+               if (g_strrstr(command,"Quit")) {
+                 g_message("Removing Thead_id: %d",thread_id_key);
+                 g_datalist_id_remove_data(&process_list,thread_id_key);
+               }else{
+                 // Thread id found in the list of processes assigned, so we need to send to the correct queue
+                 queue=g_datalist_get_data(&queue_list,thread_id);
+                 
+               }
+            }
+            data=g_string_new("");
+            GString *statement=g_string_new(elements[2]);
+            read_line(infile,FALSE,data,&eof);
+            float query_time=0;
+            found=g_regex_match_simple (regex, data->str, 0, 0);
+
+            // We are going to read the statement that needs to be send to the database
+            while (!feof(infile)&& !eof && !found){
+               if (data != NULL && data->str != NULL && !found)
+                  statement=g_string_append(statement,data->str);
+               data=g_string_new("");
+               read_line(infile,FALSE,data,&eof);
+               found=g_regex_match_simple (regex, data->str, 0, 0);
+            }
+
+            // At this point we are able to send the statement
+            if (queue!=NULL && statement != NULL && statement->str != NULL && statement->len>2 && g_strrstr(command,"Execute") ){
+               g_message("sending statement");
+               struct query *q=g_new0(struct query,1);
+               q->statement=statement->str;
+               q->time=query_time;
+               g_async_queue_push(queue, q);
+            }
+         }else{ 
+            data=g_string_new("");
+            read_line(infile,FALSE,data,&eof);
+         }
+      }
+
+}
+
+void send_to_mysql_slowlog(){ 
+      GArray * free_indexes=g_array_new(FALSE,FALSE,sizeof(int));
+
+      GData * queue_list;
+      g_datalist_init(&queue_list);
+
+      GData * process_list;
+      g_datalist_init(&process_list);
+
+      FILE *infile=stdin;
+      gboolean eof=FALSE;
+      GString *data=g_string_new("");
+      read_line(infile,FALSE,data,&eof);
+
+      GAsyncQueue* queue;
+
+      while (!feof(infile)&& !eof){
+         if (g_strrstr(data->str,"# Thread_id: ")){
+            gchar **elements = g_strsplit(data->str,":",2);
+            char * thread_id =elements[1];
+
+            GThread * thread=g_datalist_get_data(&process_list,thread_id);
+
+            if (thread==NULL){ // NULL will means that the Thread id was not found, which means that we need to establish a new connection
+               // Thread id not found in the list of processes assigned | We need to create a new process
+               queue=g_async_queue_new();
+
+               // Initilizing Thread
+               struct thread_config *config=g_new(struct thread_config,1);
+               config->host=hostlist;
+               config->queue=queue;
+               config->port=mysql_port;
+               config->mysql_connection = new_mysql_connection(config->host,config->port,NULL);
+               thread= g_thread_new("MySQL_Thread",(GThreadFunc)process_mysql_queue, config);
+
+               // Adding to the list of process
+               g_datalist_set_data(&process_list,thread_id,thread);
+               // Adding to the list of Threads id
+               g_datalist_set_data(&queue_list,thread_id,queue);
+            }else{
+               // Thread id found in the list of processes assigned, so we need to send to the correct queue
+               queue=g_datalist_get_data(&queue_list,thread_id);
+            }
+            data=g_string_new("");
+            GString *statement=g_string_new("");
+            read_line(infile,FALSE,data,&eof);
+            float query_time=0;
+
+            // We are going to read the statement that needs to be send to the database
+            while (!feof(infile)&& !eof && !g_strrstr(data->str,"# Thread_id: ")){
+              if (g_strrstr(data->str,"# Query_time: ")){
+                  gchar **elements = g_strsplit(data->str," ",5);
+                  query_time =atof(elements[3]);
+              }
+//            g_message("Sending line: %s",data->str);
+//               g_async_queue_push(queue, data->str);
+               if (data != NULL && data->str != NULL && data->str[0]!='#')
+                  statement=g_string_append(statement,data->str);
+               data=g_string_new("");
+               read_line(infile,FALSE,data,&eof);
+            }
+
+            // At this point we are able to send the statement
+            if (statement != NULL && statement->str != NULL && statement->len>2 ){
+               struct query *q=g_new0(struct query,1);
+               q->statement=statement->str;
+               q->time=query_time;
+               g_async_queue_push(queue, q);
+            }
+         }else{ // The line didn't start with "# Thread_id: ", at this point, if this happens, the line must be discarded
+            data=g_string_new("");
+            read_line(infile,FALSE,data,&eof);
+         }
+      }
+}
+
 GSocketConnection * new_connection(char *host, int port){
-
    GError * error = NULL;
-
    GSocketConnection * connection = NULL;
    GSocketClient * client = g_socket_client_new();
-
-   connection = g_socket_client_connect_to_host (client,
-                                                host,
-                                                port,
-                                                NULL,
-                                                &error);
-
+   connection = g_socket_client_connect_to_host (client, host, port, NULL, &error);
    if (error != NULL)
    {
-//      g_error (error->message);
       g_error("Trying to connect to %s on port %d: %s",host,port,error->message);
    }else{
       g_print ("Connection successful!\n");
@@ -45,14 +217,13 @@ GSocketConnection * new_connection(char *host, int port){
    return connection;
 }
 
-MYSQL * new_mysql_connection(char *host, int port){
+MYSQL * new_mysql_connection(char *host, int port,char *db){
    MYSQL *thrconn= mysql_init(NULL);
 
-//   mysql_options(thrconn, MYSQL_READ_DEFAULT_GROUP, "myloader");
    my_bool reconnect = 1;
    mysql_options(thrconn, MYSQL_OPT_RECONNECT, &reconnect);
 
-   if (!mysql_real_connect(thrconn, host, username, password, NULL, port, socket_path, CLIENT_MULTI_STATEMENTS)) {
+   if (!mysql_real_connect(thrconn, host, username, password, db, port, socket_path, CLIENT_MULTI_STATEMENTS)) {
       g_critical("Failed to connect to MySQL server: %s", mysql_error(thrconn));
       exit(EXIT_FAILURE);
    }
@@ -60,27 +231,16 @@ MYSQL * new_mysql_connection(char *host, int port){
    return thrconn;
 }
 
-
-int send_mysql_data(MYSQL * connection,char *data) {
+int send_mysql_data(MYSQL * connection,char *data,struct thread_config *config) {
   int error ;
 //  g_message("Sending data");
   gint64 fromtime=g_get_real_time();
   error=mysql_real_query(connection, data, strlen(data));
   if (error) {
-      g_critical("Error %s%s", mysql_error(connection),data); 
+      g_critical("Error on %s: %s\n%s", config->thread_id,mysql_error(connection),data); 
       g_free(data);
   }else{
-//      g_message("OKKKK %s",data);
-  }
-  gint64 totime=g_get_real_time();
-  MYSQL_RES * result;
-  int state=0;
-  while (!state){
-     result=mysql_use_result(connection);
-//     g_message("Fetching result %s",result);
-     while (result !=NULL && mysql_fetch_row(result)!=NULL);
-     mysql_free_result(result);
-     state=mysql_next_result(connection);
+      mysql_store_result(connection);
   }
   return error;
 }
@@ -89,9 +249,14 @@ int send_data(GSocketConnection * connection,char *data) {
   GError * error = NULL;
   GOutputStream * ostream = g_io_stream_get_output_stream (G_IO_STREAM (connection));
 //  g_message("Sending data");
-  g_output_stream_write  (ostream,
+  gsize bytes_written;
+//  if (strlen(data)>1000)
+//    g_message("Line length: %d",strlen(data));
+
+  g_output_stream_write_all  (ostream,
                           data, 
                           strlen(data), 
+                          &bytes_written,
                           NULL,
                           &error);
   if (error != NULL)
@@ -103,43 +268,43 @@ int send_data(GSocketConnection * connection,char *data) {
 
 
 gboolean read_line(FILE *file, gboolean is_compressed, GString *data, gboolean *eof) {
-        const int buffersize=512;
-        char buffer[buffersize];
-        do {
-                        if (fgets(buffer, buffersize, file) == NULL) {
-                                if (feof(file)) {
-                                        *eof= TRUE;
-                                        buffer[0]= '\0';
-                                } else {
-                                        return FALSE;
-                                }
-                        }
-                if (buffer[0] != '\n' && strlen(buffer)>0)
-                        g_string_append(data, buffer);
-        } while ( strlen(buffer)>1 && (buffer[strlen(buffer)-1] != '\n') && *eof == FALSE);
-
-        return TRUE;
+  const int buffersize=512;
+  char buffer[buffersize];
+  do {
+    if (fgets(buffer, buffersize, file) == NULL) {
+      if (feof(file)) {
+        *eof= TRUE;
+        buffer[0]= '\0';
+      } else {
+        return FALSE;
+    }
+  }
+  if (buffer[0] != '\n' && strlen(buffer)>0)
+    g_string_append(data, buffer);
+  } while ( strlen(buffer)>1 && (buffer[strlen(buffer)-1] != '\n') && *eof == FALSE);
+  return TRUE;
 }
 
 void *process_queue(struct thread_config *config) {
-   for(;;) {
-      char * line= (char*)g_async_queue_pop(config->queue);
-      if (g_strrstr(line,"END THREAD"))
-         break;
-      send_data(config->connection,line);
-   }
+  for(;;) {
+     char * line= (char*)g_async_queue_pop(config->queue);
+     if (g_strrstr(line,"END THREAD"))
+        break;
+     send_data(config->connection,line);
+  }
   return NULL;
 }
 
 void *process_mysql_queue(struct thread_config *config) {
-   g_message("Adding new process");
-   for(;;) {
-      struct query *q =(struct query *)g_async_queue_pop(config->queue);
-      char * line= q->statement;
-      if (g_strrstr(line,"END THREAD"))
-         break;
-      send_mysql_data(config->mysql_connection,line);
-   }
+  g_message("Adding new process");
+  for(;;) {
+    struct query *q =(struct query *)g_async_queue_pop(config->queue);
+    char * line= q->statement;
+    if (g_strrstr(line,"END THREAD"))
+      break;
+    g_message("One: %d | Other: %s",mysql_thread_id(config->mysql_connection),config->thread_id);
+    send_mysql_data(config->mysql_connection,line,config);
+  }
   return NULL;
 }
 
@@ -149,7 +314,7 @@ void *process_mysql_queue(struct thread_config *config) {
 // element which is read is a slow query log
 //
 
-void *read_process(GAsyncQueue**queue){
+void *read_process_from_slowlog(GAsyncQueue**queue){
    FILE *infile=stdin;
    gboolean eof=FALSE;
    GString *data=g_string_new("");
@@ -159,28 +324,20 @@ void *read_process(GAsyncQueue**queue){
       if (g_strrstr(data->str,"# Thread_id: ")){
          gchar **elements = g_strsplit(data->str,":",2);
          thread_id = g_ascii_strtoll(elements[1],NULL,10);
-//         g_message("Thread_id: %d \t Possition of the server: %d",thread_id,thread_id%host_length);
          g_async_queue_push(queue[thread_id%host_length], data->str);
          data=g_string_new("");
          read_line(infile,FALSE,data,&eof);
          while (!feof(infile)&& !eof && data->str[0]=='#' && !g_strrstr(data->str,"# Thread_id: ")){
-//            g_message("Discarding line: %s",data->str);
-            g_async_queue_push(queue[thread_id%host_length], data->str);
-            data=g_string_new("");
-            read_line(infile,FALSE,data,&eof);
-         } //while (!feof(infile)&& !eof && data->str[0]=='#' && !g_strrstr(data->str,"# Thread_id: "));
-//         char *more_data=g_strdup_printf ("# Thread_id: %ld\n",thread_id);
-//         send_data(shostlist[thread_id%host_length],more_data);
-//         g_async_queue_push(queue[thread_id%host_length], more_data);
-         while (!feof(infile)&& !eof && data->str[0]!='#'){
-//            g_message("Thread_id %d : %s",thread_id,data->str);
             g_async_queue_push(queue[thread_id%host_length], data->str);
             data=g_string_new("");
             read_line(infile,FALSE,data,&eof);
          }
-
+         while (!feof(infile)&& !eof && data->str[0]!='#'){
+            g_async_queue_push(queue[thread_id%host_length], data->str);
+            data=g_string_new("");
+            read_line(infile,FALSE,data,&eof);
+         }
       }else{
-   //      g_message("Discarding line: %s",data->str);
          if (thread_id!=0) g_async_queue_push(queue[thread_id%host_length], data->str);
          data=g_string_new("");
          read_line(infile,FALSE,data,&eof);
@@ -193,8 +350,61 @@ void *read_process(GAsyncQueue**queue){
    return NULL;
 }
 
+void *read_process_from_general(GAsyncQueue**queue){
+   FILE *infile=stdin;
+   gboolean eof=FALSE;
+   GString *data=g_string_new("");
+
+   read_line(infile,FALSE,data,&eof);
+   gint64 thread_id = 0;
+   gboolean found;
+   while (!feof(infile)&& !eof){
+      found=g_regex_match_simple (regex, data->str, 0, 0);
+      if (found){
+         gchar **elements = g_strsplit(data->str,"\t",2);
+         thread_id = g_ascii_strtoll(elements[1],NULL,10);
+         g_async_queue_push(queue[thread_id%host_length], data->str);
+         data=g_string_new("");
+         read_line(infile,FALSE,data,&eof);
+         found=g_regex_match_simple (regex, data->str, 0, 0);
+         while (!feof(infile)&& !eof && !found){
+            g_async_queue_push(queue[thread_id%host_length], data->str);
+            data=g_string_new("");
+            read_line(infile,FALSE,data,&eof);
+            found=g_regex_match_simple (regex, data->str, 0, 0);
+         }
+      }else{
+         if (thread_id!=0) g_async_queue_push(queue[thread_id%host_length], data->str);
+         data=g_string_new("");
+         read_line(infile,FALSE,data,&eof);
+      }
+   }
+   int i=0;
+   for (; i < host_length;i++){
+      g_async_queue_push(queue[i], "END THREAD");
+   }
+   return NULL;
+}
+
+
 int main (int argc, char *argv[]){
+
+GData * keylist;
+g_datalist_init(&keylist);
+char * data;
+data = g_strdup("hola");
+int id=1;
+g_datalist_id_set_data(&keylist,id,data);
+char * dd=g_datalist_id_get_data(&keylist,id);
+g_message("%s",dd);
+data = g_strdup("HOLA");
+id = 2;
+g_datalist_id_set_data(&keylist,id,data);
+dd=g_datalist_id_get_data(&keylist,id);
+g_message("%s",dd);
+
    GError *error= NULL;
+
    GOptionContext *context;
    context= g_option_context_new("multi-threaded MySQL loader");
    GOptionGroup *main_group= g_option_group_new("main", "Main Options", "Main Options", NULL, NULL);
@@ -231,75 +441,32 @@ int main (int argc, char *argv[]){
          }
          config->connection = new_connection(config->host,config->port);
          if (config->connection == NULL) exit(2);
-         threads[i]= g_thread_new("lala",(GThreadFunc)process_queue, config);
+         threads[i]= g_thread_new("SOCKET_Thread",(GThreadFunc)process_queue, config);
       }
-      threads[host_length]=g_thread_new("lala",(GThreadFunc)read_process,queue);
+      if (input_type!=NULL && g_strrstr(input_type,"SLOWLOG"))
+        threads[host_length]=g_thread_new("Read_Thread",(GThreadFunc)read_process_from_slowlog,queue);
+      else
+      if (input_type!=NULL && g_strrstr(input_type,"GENERAL"))
+        threads[host_length]=g_thread_new("Read_Thread",(GThreadFunc)read_process_from_general,queue);
+      else{
+        g_error("Input type not defined or incorrect");
+        exit(1);
+      }
+        
       i=0;
       for (; i < host_length+1;i++){
          g_thread_join(threads[i]);
       }
-   }else{
-      GArray * free_indexes=g_array_new(FALSE,FALSE,sizeof(int));
-      int max_id=0;
-      GData * queue_list;
-      GData * process_list;
-      g_datalist_init(&process_list);
-      g_datalist_init(&queue_list);
-      FILE *infile=stdin;
-      gboolean eof=FALSE;
-      GString *data=g_string_new("");
-      read_line(infile,FALSE,data,&eof);
-      GAsyncQueue* queue;
-      while (!feof(infile)&& !eof){
-         if (g_strrstr(data->str,"# Thread_id: ")){
-            gchar **elements = g_strsplit(data->str,":",2);
-            char * thread_id =elements[1];
-
-            GThread * thread=g_datalist_get_data(&process_list,thread_id);
-            
-            if (thread==NULL){
-               // Thread id not found in the list of processes assigned | We need to create a new process
-               queue=g_async_queue_new();
-               struct thread_config *config=g_new(struct thread_config,1);
-               config->host=hostlist;
-               config->queue=queue;
-               config->port=mysql_port;
-               config->mysql_connection = new_mysql_connection(config->host,config->port);
-               thread= g_thread_new("lala",(GThreadFunc)process_mysql_queue, config);
-               g_datalist_set_data(&process_list,thread_id,thread);
-               g_datalist_set_data(&queue_list,thread_id,queue);
-            }else{
-               // Thread id found in the list of processes assigned, so we need to send to the correct queue
-               queue=g_datalist_get_data(&queue_list,thread_id);
-            }
-            data=g_string_new("");
-            GString *statement=g_string_new("");
-            read_line(infile,FALSE,data,&eof);
-            float query_time=0;
-            while (!feof(infile)&& !eof && !g_strrstr(data->str,"# Thread_id: ")){
-              if (g_strrstr(data->str,"# Query_time: ")){
-                  gchar **elements = g_strsplit(data->str," ",5);
-                  query_time =atof(elements[3]);
-              }
-//            g_message("Sending line: %s",data->str);
-//               g_async_queue_push(queue, data->str);
-               if (data != NULL && data->str != NULL && data->str[0]!='#')
-                  statement=g_string_append(statement,data->str);
-               data=g_string_new("");
-               read_line(infile,FALSE,data,&eof);
-            } 
-            if (statement != NULL && statement->str != NULL && statement->len>2 ){
-               struct query *q=g_new0(struct query,1);
-               q->statement=statement->str;
-               q->time=query_time;
-               g_async_queue_push(queue, q);
-            }
-         }else{
-//         g_message("Discarding line: %s",data->str);
-            
-            data=g_string_new("");
-            read_line(infile,FALSE,data,&eof);
-         }
+   }else{  // MYSQL connection:
+     g_message("MySQL");
+     if (input_type!=NULL && g_strrstr(input_type,"SLOWLOG"))
+        send_to_mysql_slowlog();
+     else
+      if (input_type!=NULL && g_strrstr(input_type,"GENERAL"))
+         send_to_mysql_general();
+      else{
+        g_error("Input type not defined or incorrect");
+        exit(1);
       }
    }
 }

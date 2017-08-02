@@ -11,6 +11,7 @@ guint mysql_port=3306;
 struct thread_config {
    char *host;
    int port;
+   char *thread_id; 
    GAsyncQueue * queue;
    GSocketConnection *connection;
    MYSQL *mysql_connection;
